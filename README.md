@@ -276,6 +276,206 @@ public CompletableFuture<String> getValueByAsync(String value) {
 }
 ```
 
-@Async 어노테이션을 사용할 때는 Public 메소드에만 사용 가능하고, 같은 인스턴스 내의 메소드끼리만 호출할 때는 비동기 호출이 되지 않는것을 주의해야합니다.
+@Async 어노테이션을 사용할 때는 프록시 객체 생성을 위해 Public 메소드에만 사용 가능하고, 같은 인스턴스 내의 메소드끼리만 호출할 때는 비동기 호출이 되지 않는것을 주의해야합니다.
+
+@Async 어노테이션을 선언하여 메소드가 비동기로 동작하는 것을 확인하였습니다. 그렇다면 Spring Framework에서 어떻게 처리하길래 @Async 어노테이션만 붙이면 비동기 처리가 되는걸까요?
+
+@EnableAsync의 내부를 보면 `AsyncConfigurationSelector` 클래스를 Import하고 있고, adviceMode에 따라 아래와 같이 메서드의 비동기 수행을 적용시켜줄 Configuration 클래스를 import하게 됩니다.
+
+```java
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Import(AsyncConfigurationSelector.class)
+public @interface EnableAsync {
+```
+
+```java
+public class AsyncConfigurationSelector extends AdviceModeImportSelector<EnableAsync> {
+
+	private static final String ASYNC_EXECUTION_ASPECT_CONFIGURATION_CLASS_NAME =
+			"org.springframework.scheduling.aspectj.AspectJAsyncConfiguration";
+
+
+	/**
+	 * Returns {@link ProxyAsyncConfiguration} or {@code AspectJAsyncConfiguration}
+	 * for {@code PROXY} and {@code ASPECTJ} values of {@link EnableAsync#mode()},
+	 * respectively.
+	 */
+	@Override
+	@Nullable
+	public String[] selectImports(AdviceMode adviceMode) {
+		switch (adviceMode) {
+			case PROXY:
+				return new String[] {ProxyAsyncConfiguration.class.getName()};
+			case ASPECTJ:
+				return new String[] {ASYNC_EXECUTION_ASPECT_CONFIGURATION_CLASS_NAME};
+			default:
+				return null;
+		}
+	}
+
+}
+```
+
+`ProxyAsyncConfiguration` 클래스를 보면 `AsyncAnnotationBeanPostProcessor`스프링 빈을 등록하고 있습니다(`BeanPostProcssor`의 일종). 이 `BeanPostProcessor`가 스프링 애플리케이션이 시작되고 애플리케이션 레벨의 스프링 빈이 생성 및 후처리를 하는 과정에서 해당 빈의 public 메서드에 @Async가 존재하는 빈을 찾아 AOP Proxy로 wrapping 및 비동기 수행 AOP를 위한 `AsyncAnnotationAdvisor`를 추가하게 됩니다.
+```java
+@Configuration(proxyBeanMethods = false)
+@Role(BeanDefinition.ROLE_INFRASTRUCTURE)
+public class ProxyAsyncConfiguration extends AbstractAsyncConfiguration {
+
+	@Bean(name = TaskManagementConfigUtils.ASYNC_ANNOTATION_PROCESSOR_BEAN_NAME)
+	@Role(BeanDefinition.ROLE_INFRASTRUCTURE)
+	public AsyncAnnotationBeanPostProcessor asyncAdvisor() {
+		Assert.notNull(this.enableAsync, "@EnableAsync annotation metadata was not injected");
+		AsyncAnnotationBeanPostProcessor bpp = new AsyncAnnotationBeanPostProcessor();
+		bpp.configure(this.executor, this.exceptionHandler);
+		Class<? extends Annotation> customAsyncAnnotation = this.enableAsync.getClass("annotation");
+		if (customAsyncAnnotation != AnnotationUtils.getDefaultValue(EnableAsync.class, "annotation")) {
+			bpp.setAsyncAnnotationType(customAsyncAnnotation);
+		}
+		bpp.setProxyTargetClass(this.enableAsync.getBoolean("proxyTargetClass"));
+		bpp.setOrder(this.enableAsync.<Integer>getNumber("order"));
+		return bpp;
+	}
+
+}
+```
+
+```java
+public class AsyncAnnotationBeanPostProcessor extends AbstractBeanFactoryAwareAdvisingPostProcessor {
+    ...
+    
+    @Override
+	public void setBeanFactory(BeanFactory beanFactory) {
+		super.setBeanFactory(beanFactory);
+
+		AsyncAnnotationAdvisor advisor = new AsyncAnnotationAdvisor(this.executor, this.exceptionHandler);
+		if (this.asyncAnnotationType != null) {
+			advisor.setAsyncAnnotationType(this.asyncAnnotationType);
+		}
+		advisor.setBeanFactory(beanFactory);
+		this.advisor = advisor;
+	}
+}
+```
+
+위 Configuration을 통해 우리가 정의하고 @Async를 추가 한 스프링 Bean에 비동기 수행이 가능해지게 됩니다.
+
+해당 스프링 Bean 클래스를 상속받은 `CglibAopProxy` 객체에 실제 메소드 호출 전/후에 수행될 수 있는 부가기능 관련 정보를 저장하는데, `DynamicAdvisedInterceptor`라는 AOP 전용 콜백에 `AsyncAnnotationAdvisor`가 적재됩니다. 이 advisor는 메소드 수행을 intercept해서 Executor를 통해서 비동기 처리할 수 있게 만드는 advice인 `AnnotationAsyncExecutionInterceptor`가 세팅됩니다.
+
+```java
+public class AsyncAnnotationAdvisor extends AbstractPointcutAdvisor implements BeanFactoryAware {
+
+	private Advice advice;
+
+	private Pointcut pointcut;
+    
+    public AsyncAnnotationAdvisor(
+			@Nullable Supplier<Executor> executor, @Nullable Supplier<AsyncUncaughtExceptionHandler> exceptionHandler) {
+
+		Set<Class<? extends Annotation>> asyncAnnotationTypes = new LinkedHashSet<>(2);
+		asyncAnnotationTypes.add(Async.class);
+		try {
+			asyncAnnotationTypes.add((Class<? extends Annotation>)
+					ClassUtils.forName("javax.ejb.Asynchronous", AsyncAnnotationAdvisor.class.getClassLoader()));
+		}
+		catch (ClassNotFoundException ex) {
+			// If EJB 3.1 API not present, simply ignore.
+		}
+		this.advice = buildAdvice(executor, exceptionHandler);
+		this.pointcut = buildPointcut(asyncAnnotationTypes);
+	}
+    
+    protected Advice buildAdvice(
+			@Nullable Supplier<Executor> executor, @Nullable Supplier<AsyncUncaughtExceptionHandler> exceptionHandler) {
+
+		AnnotationAsyncExecutionInterceptor interceptor = new AnnotationAsyncExecutionInterceptor(null);
+		interceptor.configure(executor, exceptionHandler);
+		return interceptor;
+	}
+}
+```
+
+메소드 Call intercept 및 비동기 처리 AOP 기능 수행은 `AsyncExecutionInterceptor`에서 진행됩니다.
+
+큰 흐름은 TaskExcutor를 찾고, Lambda를 통해 실제 메소드 Call을 Callable 객체로 만들고, 해당 작업을 submit 하는 흐름입니다.
+
+Excutor 결정시 @Async 결정시 지정한 TaskExcutor 빈이나 지정하지 않았을 경우 TaskExcutor빈 중 우선 생성된 빈을 BeanFactory로부터 가져와 사용합니다.
+
+```java
+public class AsyncExecutionInterceptor extends AsyncExecutionAspectSupport implements MethodInterceptor, Ordered {
+    // ...
+    
+    /**
+	 * Intercept the given method invocation, submit the actual calling of the method to
+	 * the correct task executor and return immediately to the caller.
+	 * @param invocation the method to intercept and make asynchronous
+	 * @return {@link Future} if the original method returns {@code Future}; {@code null}
+	 * otherwise.
+	 */
+	@Override
+	@Nullable
+	public Object invoke(final MethodInvocation invocation) throws Throwable {
+		Class<?> targetClass = (invocation.getThis() != null ? AopUtils.getTargetClass(invocation.getThis()) : null);
+		Method specificMethod = ClassUtils.getMostSpecificMethod(invocation.getMethod(), targetClass);
+		final Method userDeclaredMethod = BridgeMethodResolver.findBridgedMethod(specificMethod);
+
+		AsyncTaskExecutor executor = determineAsyncExecutor(userDeclaredMethod);
+		if (executor == null) {
+			throw new IllegalStateException(
+					"No executor specified and no default executor set on AsyncExecutionInterceptor either");
+		}
+
+		Callable<Object> task = () -> {
+			try {
+				Object result = invocation.proceed();
+				if (result instanceof Future) {
+					return ((Future<?>) result).get();
+				}
+			}
+			catch (ExecutionException ex) {
+				handleError(ex.getCause(), userDeclaredMethod, invocation.getArguments());
+			}
+			catch (Throwable ex) {
+				handleError(ex, userDeclaredMethod, invocation.getArguments());
+			}
+			return null;
+		};
+
+		return doSubmit(task, executor, invocation.getMethod().getReturnType());
+	}
+
+}
+```
+
+doSubmit 내에서 submit을 하게 되면 이제는 각 TaskExecutor 구현체의 영역이고 각 구현 방식에 따라 concurrency 제어가 일어나게 됩니다. 
+
+
+Async 처리시 TaskExecutor의 구현체로 `ThreadPoolTaskExecutor`를 사용하면 스레드 풀링을 통해서 concurrency와 함께 리소스 효율을 볼 수 있습니다. `ThreadPoolTaskExecutor`는 내부적으로 java의 ThreadPoolExecutor를 wrapping하여 호출하고 있으므로 실제 어떻게 pooling이 되는지는 ThreadPoolExecutor 동작이라고 보면 됩니다.
+
+ThreadPoolExecutor의 동작을 요약하자면 아래와 같습니다.
+
+- corePoolSize 만큼 요청이 들어오면 그만큼 메소드 Call시 해당 Task를 담당할 Thread가 생성되어 처리를 시작
+- corePoolSize 이상 요청이 들어오면 queue에 적재(현재 idle한 Thread가 존재하지 않고, 신규 생성도 불가)
+- Method Call이 쌓여 queue Size를 초과하게 되면, 그때부터의 maxPoolSize까지 추가로 Thread를 생성해 queue에 적재되지 않은 초과된 Task를 할당받아 수행
+- queue가 해소되고 idle상태가 아닌 maxPoolSize - corePoolSize 만큼의 Thread는 keepAliveSeconds가 지나면 리소스 해제
+
+
+참고한 곳
+
+http://www.bigsoft.co.uk/blog/2009/11/27/rules-of-a-threadpoolexecutor-pool-size
+
+https://docs.spring.io/spring-framework/docs/3.2.x/spring-framework-reference/html/scheduling.html
+
+https://eminentstar.tistory.com/73
+
+https://github.com/google/guava/wiki/ListenableFutureExplained
+
+https://www.baeldung.com/spring-async
+
+https://www.baeldung.com/java-asynchronous-programming
+
+https://spring.io/guides/gs/async-method/
 
 
